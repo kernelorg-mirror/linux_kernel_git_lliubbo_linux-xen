@@ -339,7 +339,8 @@ struct xen_blkif {
 	unsigned long long			st_wr_sect;
 	unsigned int nr_ring_pages;
 	/* All rings for this device */
-	struct xen_blkif_ring ring;
+	struct xen_blkif_ring *rings;
+	unsigned int nr_rings;
 };
 
 struct seg_buf {
