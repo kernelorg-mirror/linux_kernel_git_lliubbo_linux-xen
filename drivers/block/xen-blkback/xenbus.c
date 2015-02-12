@@ -28,6 +28,8 @@
 #define RINGREF_NAME_LEN (20)
 #define RINGREF_NAME_LEN (20)
 
+extern unsigned int xenblk_max_queues;
+
 struct backend_info {
 	struct xenbus_device	*dev;
 	struct xen_blkif	*blkif;
@@ -191,11 +193,6 @@ static struct xen_blkif *xen_blkif_alloc(domid_t domid)
 	atomic_set(&blkif->drain, 0);
 	INIT_WORK(&blkif->free_work, xen_blkif_deferred_free);
 
-	blkif->nr_rings = 1;
-	if (xen_blkif_alloc_rings(blkif)) {
-		kmem_cache_free(xen_blkif_cachep, blkif);
-		return ERR_PTR(-ENOMEM);
-	}
 	return blkif;
 }
 
@@ -618,6 +615,14 @@ static int xen_blkbk_probe(struct xenbus_device *dev,
 		goto fail;
 	}
 
+	/* Multi-queue: wrte how many queues backend supported. */
+	err = xenbus_printf(XBT_NIL, dev->nodename,
+			    "multi-queue-max-queues", "%u", xenblk_max_queues);
+	if (err) {
+		pr_debug("Error writing multi-queue-num-queues\n");
+		goto fail;
+	}
+
 	/* setup back pointer */
 	be->blkif->be = be;
 
@@ -1008,6 +1013,7 @@ static int connect_ring(struct backend_info *be)
 	char *xspath;
 	size_t xspathsize;
 	const size_t xenstore_path_ext_size = 11; /* sufficient for "/queue-NNN" */
+	unsigned int requested_num_queues = 0;
 
 	pr_debug("%s %s\n", __func__, dev->otherend);
 
@@ -1034,6 +1040,26 @@ static int connect_ring(struct backend_info *be)
 
 	be->blkif->vbd.feature_gnt_persistent = pers_grants;
 	be->blkif->vbd.overflow_max_grants = 0;
+
+	/*
+	 * Read the number of hardware queus from frontend.
+	 */
+	err = xenbus_scanf(XBT_NIL, dev->otherend, "multi-queue-num-queues", "%u", &requested_num_queues);
+	if (err < 0) {
+		requested_num_queues = 1;
+	} else {
+		if (requested_num_queues > xenblk_max_queues
+		    || requested_num_queues == 0) {
+			/* buggy or malicious guest */
+			xenbus_dev_fatal(dev, err,
+					"guest requested %u queues, exceeding the maximum of %u.",
+					requested_num_queues, xenblk_max_queues);
+			return -1;
+		}
+	}
+	be->blkif->nr_rings = requested_num_queues;
+	if (xen_blkif_alloc_rings(be->blkif))
+		return -ENOMEM;
 
 	pr_info("nr_rings:%d protocol %d (%s) %s\n", be->blkif->nr_rings,
 		 be->blkif->blk_protocol, protocol,
