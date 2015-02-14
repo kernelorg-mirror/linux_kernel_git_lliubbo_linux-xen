@@ -132,6 +132,7 @@ struct blkfront_ring_info
 	unsigned int ring_ref[XENBUS_MAX_RING_PAGES];
 	unsigned int evtchn, irq;
 	struct work_struct work;
+	struct work_struct done_work;
 	struct gnttab_free_callback callback;
 	struct blk_shadow shadow[BLK_MAX_RING_SIZE];
 	struct list_head grants;
@@ -644,7 +645,7 @@ static int blkif_queue_rq(struct blk_mq_hw_ctx *hctx,
 	struct blkfront_ring_info *rinfo = (struct blkfront_ring_info *)hctx->driver_data;
 
 	blk_mq_start_request(qd->rq);
-	spin_lock_irq(&rinfo->ring_lock);
+	spin_lock(&rinfo->ring_lock);
 	if (RING_FULL(&rinfo->ring))
 		goto out_busy;
 
@@ -655,15 +656,15 @@ static int blkif_queue_rq(struct blk_mq_hw_ctx *hctx,
 		goto out_busy;
 
 	flush_requests(rinfo);
-	spin_unlock_irq(&rinfo->ring_lock);
+	spin_unlock(&rinfo->ring_lock);
 	return BLK_MQ_RQ_QUEUE_OK;
 
 out_err:
-	spin_unlock_irq(&rinfo->ring_lock);
+	spin_unlock(&rinfo->ring_lock);
 	return BLK_MQ_RQ_QUEUE_ERROR;
 
 out_busy:
-	spin_unlock_irq(&rinfo->ring_lock);
+	spin_unlock(&rinfo->ring_lock);
 	blk_mq_stop_hw_queue(hctx);
 	return BLK_MQ_RQ_QUEUE_BUSY;
 }
@@ -949,6 +950,7 @@ static void xlvbd_release_gendisk(struct blkfront_dev_info *dinfo)
 
 		/* Flush gnttab callback work. Must be done with no locks held. */
 		flush_work(&rinfo->work);
+		flush_work(&rinfo->done_work);
 	}
 
 	del_gendisk(dinfo->gd);
@@ -976,10 +978,10 @@ static void blkif_restart_queue(struct work_struct *work)
 {
 	struct blkfront_ring_info *rinfo = container_of(work, struct blkfront_ring_info, work);
 
-	spin_lock_irq(&rinfo->ring_lock);
+	spin_lock(&rinfo->ring_lock);
 	if (rinfo->dinfo->connected == BLKIF_STATE_CONNECTED)
 		kick_pending_request_queues(rinfo);
-	spin_unlock_irq(&rinfo->ring_lock);
+	spin_unlock(&rinfo->ring_lock);
 }
 
 static void blkif_free(struct blkfront_dev_info *dinfo, int suspend)
@@ -999,7 +1001,7 @@ static void blkif_free(struct blkfront_dev_info *dinfo, int suspend)
 	for (r_index = 0; r_index < dinfo->nr_rings; r_index++) {
 		rinfo = &dinfo->rinfo[r_index];
 
-		spin_lock_irq(&rinfo->ring_lock);
+		spin_lock(&rinfo->ring_lock);
 		/* Remove all persistent grants */
 		if (!list_empty(&rinfo->grants)) {
 			list_for_each_entry_safe(persistent_gnt, n,
@@ -1075,10 +1077,11 @@ free_shadow:
 
 		/* No more gnttab callback work. */
 		gnttab_cancel_free_callback(&rinfo->callback);
-		spin_unlock_irq(&rinfo->ring_lock);
+		spin_unlock(&rinfo->ring_lock);
 
 		/* Flush gnttab callback work. Must be done with no locks held. */
 		flush_work(&rinfo->work);
+		flush_work(&rinfo->done_work);
 
 		/* Free resources associated with old device channel. */
 		for (i = 0; i < dinfo->pages_per_ring; i++) {
@@ -1175,19 +1178,15 @@ static void blkif_completion(struct blk_shadow *s, struct blkfront_ring_info *ri
 	}
 }
 
-static irqreturn_t blkif_interrupt(int irq, void *dev_id)
+static void blkif_done_req(struct work_struct *work)
 {
 	struct request *req;
 	struct blkif_response *bret;
 	RING_IDX i, rp;
-	unsigned long flags;
-	struct blkfront_ring_info *rinfo = (struct blkfront_ring_info *)dev_id;
+	struct blkfront_ring_info *rinfo = container_of(work, struct blkfront_ring_info, done_work);
 	struct blkfront_dev_info *dinfo = rinfo->dinfo;
 
-	if (unlikely(dinfo->connected != BLKIF_STATE_CONNECTED))
-		return IRQ_HANDLED;
-
-	spin_lock_irqsave(&rinfo->ring_lock, flags);
+	spin_lock(&rinfo->ring_lock);
  again:
 	rp = rinfo->ring.sring->rsp_prod;
 	rmb(); /* Ensure we see queued responses up to 'rp'. */
@@ -1280,8 +1279,17 @@ static irqreturn_t blkif_interrupt(int irq, void *dev_id)
 
 	kick_pending_request_queues(rinfo);
 
-	spin_unlock_irqrestore(&rinfo->ring_lock, flags);
+	spin_unlock(&rinfo->ring_lock);
+}
 
+static irqreturn_t blkif_interrupt(int irq, void *dev_id)
+{
+	struct blkfront_ring_info *rinfo = (struct blkfront_ring_info *)dev_id;
+
+	if (unlikely(rinfo->dinfo->connected != BLKIF_STATE_CONNECTED))
+		return IRQ_HANDLED;
+
+	schedule_work(&rinfo->done_work);
 	return IRQ_HANDLED;
 }
 
@@ -1618,6 +1626,7 @@ static int blkfront_probe(struct xenbus_device *dev,
 		rinfo->persistent_gnts_c = 0;
 		rinfo->dinfo = dinfo;
 		INIT_WORK(&rinfo->work, blkif_restart_queue);
+		INIT_WORK(&rinfo->done_work, blkif_done_req);
 	}
 
 	/* Front end dir is a number, which is used as the id. */
@@ -1719,10 +1728,10 @@ static int blkif_recover(struct blkfront_dev_info *dinfo)
 	for (r_index = 0; r_index < dinfo->nr_rings; r_index++) {
 		rinfo = &dinfo->rinfo[r_index];
 
-		spin_lock_irq(&rinfo->ring_lock);
+		spin_lock(&rinfo->ring_lock);
 		/* Kick any other new requests queued since we resumed */
 		kick_pending_request_queues(rinfo);
-		spin_unlock_irq(&rinfo->ring_lock);
+		spin_unlock(&rinfo->ring_lock);
 	}
 
 	list_for_each_entry_safe(req, n, &requests, queuelist) {
@@ -2115,9 +2124,9 @@ static void blkfront_connect(struct blkfront_dev_info *dinfo)
 	for (i = 0; i < dinfo->nr_rings; i++) {
 		rinfo = &dinfo->rinfo[i];
 
-		spin_lock_irq(&rinfo->ring_lock);
+		spin_lock(&rinfo->ring_lock);
 		kick_pending_request_queues(rinfo);
-		spin_unlock_irq(&rinfo->ring_lock);
+		spin_unlock(&rinfo->ring_lock);
 	}
 
 	add_disk(dinfo->gd);
