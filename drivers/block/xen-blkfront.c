@@ -107,7 +107,7 @@ static unsigned int xen_blkif_max_ring_order;
 module_param_named(max_ring_page_order, xen_blkif_max_ring_order, int, S_IRUGO);
 MODULE_PARM_DESC(max_ring_page_order, "Maximum order of pages to be used for the shared ring");
 
-#define BLK_RING_SIZE(dinfo) __CONST_RING_SIZE(blkif, PAGE_SIZE * (dinfo)->nr_ring_pages)
+#define BLK_RING_SIZE(dinfo) __CONST_RING_SIZE(blkif, PAGE_SIZE * (dinfo)->pages_per_ring)
 #define BLK_MAX_RING_SIZE __CONST_RING_SIZE(blkif, PAGE_SIZE * XENBUS_MAX_RING_PAGES)
 /*
  * ring-ref%i i=(-1UL) would take 11 characters + 'ring-ref' is 8, so 19
@@ -157,9 +157,10 @@ struct blkfront_dev_info {
 	unsigned int feature_persistent:1;
 	unsigned int max_indirect_segments;
 	int is_ready;
-	unsigned int nr_ring_pages;
+	unsigned int pages_per_ring;
 	struct blk_mq_tag_set tag_set;
-	struct blkfront_ring_info rinfo;
+	struct blkfront_ring_info *rinfo;
+	unsigned int nr_rings;
 };
 
 static unsigned int nr_minors;
@@ -191,7 +192,7 @@ static DEFINE_SPINLOCK(minor_lock);
 	((_segs + SEGS_PER_INDIRECT_FRAME - 1)/SEGS_PER_INDIRECT_FRAME)
 
 static int blkfront_setup_indirect(struct blkfront_ring_info *rinfo);
-static int blkfront_gather_backend_features(struct blkfront_dev_info *dinfo);
+static void __blkfront_gather_backend_features(struct blkfront_dev_info *dinfo);
 
 static int get_id_from_freelist(struct blkfront_ring_info *rinfo)
 {
@@ -668,7 +669,7 @@ static int blk_mq_init_hctx(struct blk_mq_hw_ctx *hctx, void *data,
 {
 	struct blkfront_dev_info *dinfo = (struct blkfront_dev_info *)data;
 
-	hctx->driver_data = &dinfo->rinfo;
+	hctx->driver_data = &dinfo->rinfo[index];
 	return 0;
 }
 
@@ -927,8 +928,8 @@ static int xlvbd_alloc_gendisk(blkif_sector_t capacity,
 
 static void xlvbd_release_gendisk(struct blkfront_dev_info *dinfo)
 {
-	unsigned int minor, nr_minors;
-	struct blkfront_ring_info *rinfo = &dinfo->rinfo;
+	unsigned int minor, nr_minors, i;
+	struct blkfront_ring_info *rinfo;
 
 	if (dinfo->rq == NULL)
 		return;
@@ -936,11 +937,15 @@ static void xlvbd_release_gendisk(struct blkfront_dev_info *dinfo)
 	/* No more blkif_request(). */
 	blk_mq_stop_hw_queues(dinfo->rq);
 
-	/* No more gnttab callback work. */
-	gnttab_cancel_free_callback(&rinfo->callback);
+	for (i = 0; i < dinfo->nr_rings; i++) {
+		rinfo = &dinfo->rinfo[i];
 
-	/* Flush gnttab callback work. Must be done with no locks held. */
-	flush_work(&rinfo->work);
+		/* No more gnttab callback work. */
+		gnttab_cancel_free_callback(&rinfo->callback);
+
+		/* Flush gnttab callback work. Must be done with no locks held. */
+		flush_work(&rinfo->work);
+	}
 
 	del_gendisk(dinfo->gd);
 
@@ -977,8 +982,8 @@ static void blkif_free(struct blkfront_dev_info *dinfo, int suspend)
 {
 	struct grant *persistent_gnt;
 	struct grant *n;
-	int i, j, segs;
-	struct blkfront_ring_info *rinfo = &dinfo->rinfo;
+	int i, j, segs, r_index;
+	struct blkfront_ring_info *rinfo;
 
 	/* Prevent new requests being issued until we fix things up. */
 	spin_lock_irq(&dinfo->io_lock);
@@ -988,100 +993,103 @@ static void blkif_free(struct blkfront_dev_info *dinfo, int suspend)
 	if (dinfo->rq)
 		blk_mq_stop_hw_queues(dinfo->rq);
 
-	/* Remove all persistent grants */
-	if (!list_empty(&rinfo->grants)) {
-		list_for_each_entry_safe(persistent_gnt, n,
-					 &rinfo->grants, node) {
-			list_del(&persistent_gnt->node);
-			if (persistent_gnt->gref != GRANT_INVALID_REF) {
-				gnttab_end_foreign_access(persistent_gnt->gref,
-				                          0, 0UL);
-				rinfo->persistent_gnts_c--;
+	for (r_index = 0; r_index < dinfo->nr_rings; r_index++) {
+		rinfo = &dinfo->rinfo[r_index];
+
+		/* Remove all persistent grants */
+		if (!list_empty(&rinfo->grants)) {
+			list_for_each_entry_safe(persistent_gnt, n,
+						 &rinfo->grants, node) {
+				list_del(&persistent_gnt->node);
+				if (persistent_gnt->gref != GRANT_INVALID_REF) {
+					gnttab_end_foreign_access(persistent_gnt->gref,
+								  0, 0UL);
+					rinfo->persistent_gnts_c--;
+				}
+				if (dinfo->feature_persistent)
+					__free_page(pfn_to_page(persistent_gnt->pfn));
+				kfree(persistent_gnt);
 			}
-			if (dinfo->feature_persistent)
-				__free_page(pfn_to_page(persistent_gnt->pfn));
-			kfree(persistent_gnt);
 		}
-	}
-	BUG_ON(rinfo->persistent_gnts_c != 0);
+		BUG_ON(rinfo->persistent_gnts_c != 0);
 
-	/*
-	 * Remove indirect pages, this only happens when using indirect
-	 * descriptors but not persistent grants
-	 */
-	if (!list_empty(&rinfo->indirect_pages)) {
-		struct page *indirect_page, *n;
-
-		BUG_ON(dinfo->feature_persistent);
-		list_for_each_entry_safe(indirect_page, n, &rinfo->indirect_pages, lru) {
-			list_del(&indirect_page->lru);
-			__free_page(indirect_page);
-		}
-	}
-
-	for (i = 0; i < BLK_RING_SIZE(dinfo); i++) {
 		/*
-		 * Clear persistent grants present in requests already
-		 * on the shared ring
+		 * Remove indirect pages, this only happens when using indirect
+		 * descriptors but not persistent grants
 		 */
-		if (!rinfo->shadow[i].request)
-			goto free_shadow;
+		if (!list_empty(&rinfo->indirect_pages)) {
+			struct page *indirect_page, *n;
 
-		segs = rinfo->shadow[i].req.operation == BLKIF_OP_INDIRECT ?
-		       rinfo->shadow[i].req.u.indirect.nr_segments :
-		       rinfo->shadow[i].req.u.rw.nr_segments;
-		for (j = 0; j < segs; j++) {
-			persistent_gnt = rinfo->shadow[i].grants_used[j];
-			gnttab_end_foreign_access(persistent_gnt->gref, 0, 0UL);
-			if (dinfo->feature_persistent)
-				__free_page(pfn_to_page(persistent_gnt->pfn));
-			kfree(persistent_gnt);
+			BUG_ON(dinfo->feature_persistent);
+			list_for_each_entry_safe(indirect_page, n, &rinfo->indirect_pages, lru) {
+				list_del(&indirect_page->lru);
+				__free_page(indirect_page);
+			}
 		}
 
-		if (rinfo->shadow[i].req.operation != BLKIF_OP_INDIRECT)
+		for (i = 0; i < BLK_RING_SIZE(dinfo); i++) {
 			/*
-			 * If this is not an indirect operation don't try to
-			 * free indirect segments
+			 * Clear persistent grants present in requests already
+			 * on the shared ring
 			 */
-			goto free_shadow;
+			if (!rinfo->shadow[i].request)
+				goto free_shadow;
 
-		for (j = 0; j < INDIRECT_GREFS(segs); j++) {
-			persistent_gnt = rinfo->shadow[i].indirect_grants[j];
-			gnttab_end_foreign_access(persistent_gnt->gref, 0, 0UL);
-			__free_page(pfn_to_page(persistent_gnt->pfn));
-			kfree(persistent_gnt);
-		}
+			segs = rinfo->shadow[i].req.operation == BLKIF_OP_INDIRECT ?
+			       rinfo->shadow[i].req.u.indirect.nr_segments :
+			       rinfo->shadow[i].req.u.rw.nr_segments;
+			for (j = 0; j < segs; j++) {
+				persistent_gnt = rinfo->shadow[i].grants_used[j];
+				gnttab_end_foreign_access(persistent_gnt->gref, 0, 0UL);
+				if (dinfo->feature_persistent)
+					__free_page(pfn_to_page(persistent_gnt->pfn));
+				kfree(persistent_gnt);
+			}
+
+			if (rinfo->shadow[i].req.operation != BLKIF_OP_INDIRECT)
+				/*
+				 * If this is not an indirect operation don't try to
+				 * free indirect segments
+				 */
+				goto free_shadow;
+
+			for (j = 0; j < INDIRECT_GREFS(segs); j++) {
+				persistent_gnt = rinfo->shadow[i].indirect_grants[j];
+				gnttab_end_foreign_access(persistent_gnt->gref, 0, 0UL);
+				__free_page(pfn_to_page(persistent_gnt->pfn));
+				kfree(persistent_gnt);
+			}
 
 free_shadow:
-		kfree(rinfo->shadow[i].grants_used);
-		rinfo->shadow[i].grants_used = NULL;
-		kfree(rinfo->shadow[i].indirect_grants);
-		rinfo->shadow[i].indirect_grants = NULL;
-		kfree(rinfo->shadow[i].sg);
-		rinfo->shadow[i].sg = NULL;
-	}
-
-	/* No more gnttab callback work. */
-	gnttab_cancel_free_callback(&rinfo->callback);
-	spin_unlock_irq(&dinfo->io_lock);
-
-	/* Flush gnttab callback work. Must be done with no locks held. */
-	flush_work(&rinfo->work);
-
-	/* Free resources associated with old device channel. */
-	for (i = 0; i < dinfo->nr_ring_pages; i++) {
-		if (rinfo->ring_ref[i] != GRANT_INVALID_REF) {
-			gnttab_end_foreign_access(rinfo->ring_ref[i], 0, 0);
-			rinfo->ring_ref[i] = GRANT_INVALID_REF;
+			kfree(rinfo->shadow[i].grants_used);
+			rinfo->shadow[i].grants_used = NULL;
+			kfree(rinfo->shadow[i].indirect_grants);
+			rinfo->shadow[i].indirect_grants = NULL;
+			kfree(rinfo->shadow[i].sg);
+			rinfo->shadow[i].sg = NULL;
 		}
+
+		/* No more gnttab callback work. */
+		gnttab_cancel_free_callback(&rinfo->callback);
+		spin_unlock_irq(&dinfo->io_lock);
+
+		/* Flush gnttab callback work. Must be done with no locks held. */
+		flush_work(&rinfo->work);
+
+		/* Free resources associated with old device channel. */
+		for (i = 0; i < dinfo->pages_per_ring; i++) {
+			if (rinfo->ring_ref[i] != GRANT_INVALID_REF) {
+				gnttab_end_foreign_access(rinfo->ring_ref[i], 0, 0);
+				rinfo->ring_ref[i] = GRANT_INVALID_REF;
+			}
+		}
+		free_pages((unsigned long)rinfo->ring.sring, get_order(dinfo->pages_per_ring * PAGE_SIZE));
+		rinfo->ring.sring = NULL;
+
+		if (rinfo->irq)
+			unbind_from_irqhandler(rinfo->irq, rinfo);
+		rinfo->evtchn = rinfo->irq = 0;
 	}
-	free_pages((unsigned long)rinfo->ring.sring, get_order(dinfo->nr_ring_pages * PAGE_SIZE));
-	rinfo->ring.sring = NULL;
-
-	if (rinfo->irq)
-		unbind_from_irqhandler(rinfo->irq, rinfo);
-	rinfo->evtchn = rinfo->irq = 0;
-
 }
 
 static void blkif_completion(struct blk_shadow *s, struct blkfront_ring_info *rinfo,
@@ -1276,6 +1284,26 @@ static irqreturn_t blkif_interrupt(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
+static void destroy_blkring(struct xenbus_device *dev,
+			    struct blkfront_ring_info *rinfo)
+{
+	int i;
+
+	if (rinfo->irq)
+		unbind_from_irqhandler(rinfo->irq, rinfo);
+	if (rinfo->evtchn)
+		xenbus_free_evtchn(dev, rinfo->evtchn);
+
+	for (i = 0; i < rinfo->dinfo->pages_per_ring; i++) {
+		if (rinfo->ring_ref[i] != GRANT_INVALID_REF) {
+			gnttab_end_foreign_access(rinfo->ring_ref[i], 0, 0);
+			rinfo->ring_ref[i] = GRANT_INVALID_REF;
+		}
+	}
+	free_pages((unsigned long)rinfo->ring.sring,
+		   get_order(rinfo->dinfo->pages_per_ring * PAGE_SIZE));
+	rinfo->ring.sring = NULL;
+}
 
 static int setup_blkring(struct xenbus_device *dev,
 			 struct blkfront_ring_info *rinfo)
@@ -1283,10 +1311,10 @@ static int setup_blkring(struct xenbus_device *dev,
 	struct blkif_sring *sring;
 	int err, i;
 	struct blkfront_dev_info *dinfo = rinfo->dinfo;
-	unsigned long ring_size = dinfo->nr_ring_pages * PAGE_SIZE;
+	unsigned long ring_size = dinfo->pages_per_ring * PAGE_SIZE;
 	grant_ref_t gref[XENBUS_MAX_RING_PAGES];
 
-	for (i = 0; i < dinfo->nr_ring_pages; i++)
+	for (i = 0; i < dinfo->pages_per_ring; i++)
 		rinfo->ring_ref[i] = GRANT_INVALID_REF;
 
 	sring = (struct blkif_sring *)__get_free_pages(GFP_NOIO | __GFP_HIGH,
@@ -1298,13 +1326,13 @@ static int setup_blkring(struct xenbus_device *dev,
 	SHARED_RING_INIT(sring);
 	FRONT_RING_INIT(&rinfo->ring, sring, ring_size);
 
-	err = xenbus_grant_ring(dev, rinfo->ring.sring, dinfo->nr_ring_pages, gref);
+	err = xenbus_grant_ring(dev, rinfo->ring.sring, dinfo->pages_per_ring, gref);
 	if (err < 0) {
 		free_pages((unsigned long)sring, get_order(ring_size));
 		rinfo->ring.sring = NULL;
 		goto fail;
 	}
-	for (i = 0; i < dinfo->nr_ring_pages; i++)
+	for (i = 0; i < dinfo->pages_per_ring; i++)
 		rinfo->ring_ref[i] = gref[i];
 
 	err = xenbus_alloc_evtchn(dev, &rinfo->evtchn);
@@ -1322,7 +1350,7 @@ static int setup_blkring(struct xenbus_device *dev,
 
 	return 0;
 fail:
-	blkif_free(dinfo, 0);
+	destroy_blkring(dev, rinfo);
 	return err;
 }
 
@@ -1333,65 +1361,76 @@ static int talk_to_blkback(struct xenbus_device *dev,
 {
 	const char *message = NULL;
 	struct xenbus_transaction xbt;
-	int err, i;
+	int err, i, r_index;
 	unsigned int max_page_order = 0;
 	unsigned int ring_page_order = 0;
-	struct blkfront_ring_info *rinfo = &dinfo->rinfo;
+	struct blkfront_ring_info *rinfo;
 
 	err = xenbus_scanf(XBT_NIL, dinfo->xbdev->otherend,
 			   "max-ring-page-order", "%u", &max_page_order);
 	if (err != 1)
-		dinfo->nr_ring_pages = 1;
+		dinfo->pages_per_ring = 1;
 	else {
 		ring_page_order = min(xen_blkif_max_ring_order, max_page_order);
-		dinfo->nr_ring_pages = 1 << ring_page_order;
+		dinfo->pages_per_ring = 1 << ring_page_order;
 	}
 
-	/* Create shared ring, alloc event channel. */
-	err = setup_blkring(dev, rinfo);
-	if (err)
-		goto out;
+	for (r_index = 0; r_index < dinfo->nr_rings; r_index++) {
+		rinfo = &dinfo->rinfo[r_index];
+		/* Create shared ring, alloc event channel. */
+		err = setup_blkring(dev, rinfo);
+		if (err)
+			goto out;
+	}
 
 again:
 	err = xenbus_transaction_start(&xbt);
 	if (err) {
 		xenbus_dev_fatal(dev, err, "starting transaction");
-		goto destroy_blkring;
+		goto out;
 	}
 
-	if (dinfo->nr_ring_pages == 1) {
-		err = xenbus_printf(xbt, dev->nodename,
-				    "ring-ref", "%u", rinfo->ring_ref[0]);
-		if (err) {
-			message = "writing ring-ref";
-			goto abort_transaction;
-		}
-	} else {
-		err = xenbus_printf(xbt, dev->nodename,
-				    "ring-page-order", "%u", ring_page_order);
-		if (err) {
-			message = "writing ring-page-order";
-			goto abort_transaction;
-		}
+	if (dinfo->nr_rings == 1) {
+		rinfo = &dinfo->rinfo[0];
 
-		for (i = 0; i < dinfo->nr_ring_pages; i++) {
-			char ring_ref_name[RINGREF_NAME_LEN];
-
-			snprintf(ring_ref_name, RINGREF_NAME_LEN, "ring-ref%u", i);
-			err = xenbus_printf(xbt, dev->nodename, ring_ref_name,
-					    "%u", rinfo->ring_ref[i]);
+		if (dinfo->pages_per_ring == 1) {
+			err = xenbus_printf(xbt, dev->nodename,
+					    "ring-ref", "%u", rinfo->ring_ref[0]);
 			if (err) {
 				message = "writing ring-ref";
 				goto abort_transaction;
 			}
+		} else {
+			err = xenbus_printf(xbt, dev->nodename,
+					    "ring-page-order", "%u", ring_page_order);
+			if (err) {
+				message = "writing ring-page-order";
+				goto abort_transaction;
+			}
+
+			for (i = 0; i < dinfo->pages_per_ring; i++) {
+				char ring_ref_name[RINGREF_NAME_LEN];
+
+				snprintf(ring_ref_name, RINGREF_NAME_LEN, "ring-ref%u", i);
+				err = xenbus_printf(xbt, dev->nodename, ring_ref_name,
+						    "%u", rinfo->ring_ref[i]);
+				if (err) {
+					message = "writing ring-ref";
+					goto abort_transaction;
+				}
+			}
 		}
-	}
-	err = xenbus_printf(xbt, dev->nodename,
-			    "event-channel", "%u", rinfo->evtchn);
-	if (err) {
-		message = "writing event-channel";
+		err = xenbus_printf(xbt, dev->nodename,
+				    "event-channel", "%u", rinfo->evtchn);
+		if (err) {
+			message = "writing event-channel";
+			goto abort_transaction;
+		}
+	} else {
+		/* Not supported at this stage */
 		goto abort_transaction;
 	}
+
 	err = xenbus_printf(xbt, dev->nodename, "protocol", "%s",
 			    XEN_IO_PROTO_ABI_NATIVE);
 	if (err) {
@@ -1409,12 +1448,16 @@ again:
 		if (err == -EAGAIN)
 			goto again;
 		xenbus_dev_fatal(dev, err, "completing transaction");
-		goto destroy_blkring;
+		goto out;
 	}
 
-	for (i = 0; i < BLK_RING_SIZE(dinfo); i++)
-		rinfo->shadow[i].req.u.rw.id = i+1;
-	rinfo->shadow[BLK_RING_SIZE(dinfo)-1].req.u.rw.id = 0x0fffffff;
+	for (r_index = 0; r_index < dinfo->nr_rings; r_index++) {
+		rinfo = &dinfo->rinfo[r_index];
+
+		for (i = 0; i < BLK_RING_SIZE(dinfo); i++)
+			rinfo->shadow[i].req.u.rw.id = i+1;
+		rinfo->shadow[BLK_RING_SIZE(dinfo)-1].req.u.rw.id = 0x0fffffff;
+	}
 	xenbus_switch_state(dev, XenbusStateInitialised);
 
 	return 0;
@@ -1423,9 +1466,9 @@ again:
 	xenbus_transaction_end(xbt, 1);
 	if (message)
 		xenbus_dev_fatal(dev, err, "%s", message);
- destroy_blkring:
-	blkif_free(dinfo, 0);
  out:
+	while (--r_index >= 0)
+		destroy_blkring(dev, &dinfo->rinfo[r_index]);
 	return err;
 }
 
@@ -1438,7 +1481,7 @@ again:
 static int blkfront_probe(struct xenbus_device *dev,
 			  const struct xenbus_device_id *id)
 {
-	int err, vdevice;
+	int err, vdevice, r_index;
 	struct blkfront_dev_info *dinfo;
 	struct blkfront_ring_info *rinfo;
 
@@ -1490,17 +1533,29 @@ static int blkfront_probe(struct xenbus_device *dev,
 		return -ENOMEM;
 	}
 
-	rinfo = &dinfo->rinfo;
 	mutex_init(&dinfo->mutex);
 	spin_lock_init(&dinfo->io_lock);
 	dinfo->xbdev = dev;
 	dinfo->vdevice = vdevice;
-	INIT_LIST_HEAD(&rinfo->grants);
-	INIT_LIST_HEAD(&rinfo->indirect_pages);
-	rinfo->persistent_gnts_c = 0;
 	dinfo->connected = BLKIF_STATE_DISCONNECTED;
-	rinfo->dinfo = dinfo;
-	INIT_WORK(&rinfo->work, blkif_restart_queue);
+
+	dinfo->nr_rings = 1;
+	dinfo->rinfo = kzalloc(sizeof(*rinfo) * dinfo->nr_rings, GFP_KERNEL);
+	if (!dinfo->rinfo) {
+		xenbus_dev_fatal(dev, -ENOMEM, "allocating ring_info structure");
+		kfree(dinfo);
+		return -ENOMEM;
+	}
+
+	for (r_index = 0; r_index < dinfo->nr_rings; r_index++) {
+		rinfo = &dinfo->rinfo[r_index];
+
+		INIT_LIST_HEAD(&rinfo->grants);
+		INIT_LIST_HEAD(&rinfo->indirect_pages);
+		rinfo->persistent_gnts_c = 0;
+		rinfo->dinfo = dinfo;
+		INIT_WORK(&rinfo->work, blkif_restart_queue);
+	}
 
 	/* Front end dir is a number, which is used as the id. */
 	dinfo->handle = simple_strtoul(strrchr(dev->nodename, '/')+1, NULL, 0);
@@ -1526,7 +1581,7 @@ static void split_bio_end(struct bio *bio, int error)
 
 static int blkif_recover(struct blkfront_dev_info *dinfo)
 {
-	int i;
+	int i, r_index;
 	struct request *req, *n;
 	struct blk_shadow *copy;
 	int rc;
@@ -1536,56 +1591,62 @@ static int blkif_recover(struct blkfront_dev_info *dinfo)
 	int pending, size;
 	struct split_bio *split_bio;
 	struct list_head requests;
-	struct blkfront_ring_info *rinfo = &dinfo->rinfo;
+	struct blkfront_ring_info *rinfo;
 
-	/* Stage 1: Make a safe copy of the shadow state. */
-	copy = kmemdup(rinfo->shadow, sizeof(rinfo->shadow),
-		       GFP_NOIO | __GFP_REPEAT | __GFP_HIGH);
-	if (!copy)
-		return -ENOMEM;
-
-	/* Stage 2: Set up free list. */
-	memset(&rinfo->shadow, 0, sizeof(rinfo->shadow));
-	for (i = 0; i < BLK_RING_SIZE(dinfo); i++)
-		rinfo->shadow[i].req.u.rw.id = i+1;
-	rinfo->shadow_free = rinfo->ring.req_prod_pvt;
-	rinfo->shadow[BLK_RING_SIZE(dinfo)-1].req.u.rw.id = 0x0fffffff;
-
-	rc = blkfront_gather_backend_features(dinfo);
-	if (rc) {
-		kfree(copy);
-		return rc;
-	}
-
+	__blkfront_gather_backend_features(dinfo);
 	segs = dinfo->max_indirect_segments ? : BLKIF_MAX_SEGMENTS_PER_REQUEST;
 	blk_queue_max_segments(dinfo->rq, segs);
 	bio_list_init(&bio_list);
 	INIT_LIST_HEAD(&requests);
-	for (i = 0; i < BLK_RING_SIZE(dinfo); i++) {
-		/* Not in use? */
-		if (!copy[i].request)
-			continue;
 
-		/*
-		 * Get the bios in the request so we can re-queue them.
-		 */
-		if (copy[i].request->cmd_flags &
-		    (REQ_FLUSH | REQ_FUA | REQ_DISCARD | REQ_SECURE)) {
-			/*
-			 * Flush operations don't contain bios, so
-			 * we need to requeue the whole request
-			 */
-			list_add(&copy[i].request->queuelist, &requests);
-			continue;
+	for (r_index = 0; r_index < dinfo->nr_rings; r_index++) {
+		rinfo = &dinfo->rinfo[r_index];
+
+		/* Stage 1: Make a safe copy of the shadow state. */
+		copy = kmemdup(rinfo->shadow, sizeof(rinfo->shadow),
+			       GFP_NOIO | __GFP_REPEAT | __GFP_HIGH);
+		if (!copy)
+			return -ENOMEM;
+
+		/* Stage 2: Set up free list. */
+		memset(&rinfo->shadow, 0, sizeof(rinfo->shadow));
+		for (i = 0; i < BLK_RING_SIZE(dinfo); i++)
+			rinfo->shadow[i].req.u.rw.id = i+1;
+		rinfo->shadow_free = rinfo->ring.req_prod_pvt;
+		rinfo->shadow[BLK_RING_SIZE(dinfo)-1].req.u.rw.id = 0x0fffffff;
+
+		rc = blkfront_setup_indirect(rinfo);
+		if (rc) {
+			kfree(copy);
+			return rc;
 		}
-		merge_bio.head = copy[i].request->bio;
-		merge_bio.tail = copy[i].request->biotail;
-		bio_list_merge(&bio_list, &merge_bio);
-		copy[i].request->bio = NULL;
-		blk_end_request_all(copy[i].request, 0);
-	}
 
-	kfree(copy);
+		for (i = 0; i < BLK_RING_SIZE(dinfo); i++) {
+			/* Not in use? */
+			if (!copy[i].request)
+				continue;
+
+			/*
+			 * Get the bios in the request so we can re-queue them.
+			 */
+			if (copy[i].request->cmd_flags &
+			    (REQ_FLUSH | REQ_FUA | REQ_DISCARD | REQ_SECURE)) {
+				/*
+				 * Flush operations don't contain bios, so
+				 * we need to requeue the whole request
+				 */
+				list_add(&copy[i].request->queuelist, &requests);
+				continue;
+			}
+			merge_bio.head = copy[i].request->bio;
+			merge_bio.tail = copy[i].request->biotail;
+			bio_list_merge(&bio_list, &merge_bio);
+			copy[i].request->bio = NULL;
+			blk_end_request_all(copy[i].request, 0);
+		}
+
+		kfree(copy);
+	}
 
 	xenbus_switch_state(dinfo->xbdev, XenbusStateConnected);
 
@@ -1594,8 +1655,12 @@ static int blkif_recover(struct blkfront_dev_info *dinfo)
 	/* Now safe for us to use the shared ring */
 	dinfo->connected = BLKIF_STATE_CONNECTED;
 
-	/* Kick any other new requests queued since we resumed */
-	kick_pending_request_queues(rinfo);
+	for (r_index = 0; r_index < dinfo->nr_rings; r_index++) {
+		rinfo = &dinfo->rinfo[r_index];
+
+		/* Kick any other new requests queued since we resumed */
+		kick_pending_request_queues(rinfo);
+	}
 
 	list_for_each_entry_safe(req, n, &requests, queuelist) {
 		/* Requeue pending requests (flush or discard) */
@@ -1729,6 +1794,38 @@ static void blkfront_setup_discard(struct blkfront_dev_info *dinfo)
 		dinfo->feature_secdiscard = !!discard_secure;
 }
 
+static void blkfront_clean_ring(struct blkfront_ring_info *rinfo)
+{
+	int i;
+
+	for (i = 0; i < BLK_RING_SIZE(rinfo->dinfo); i++) {
+		kfree(rinfo->shadow[i].grants_used);
+		rinfo->shadow[i].grants_used = NULL;
+		kfree(rinfo->shadow[i].sg);
+		rinfo->shadow[i].sg = NULL;
+		kfree(rinfo->shadow[i].indirect_grants);
+		rinfo->shadow[i].indirect_grants = NULL;
+	}
+	if (!list_empty(&rinfo->indirect_pages)) {
+		struct page *indirect_page, *n;
+		list_for_each_entry_safe(indirect_page, n, &rinfo->indirect_pages, lru) {
+			list_del(&indirect_page->lru);
+			__free_page(indirect_page);
+		}
+	}
+
+	if (!list_empty(&rinfo->grants)) {
+		struct grant *gnt_list_entry, *n;
+		list_for_each_entry_safe(gnt_list_entry, n,
+				&rinfo->grants, node) {
+			list_del(&gnt_list_entry->node);
+			if (rinfo->dinfo->feature_persistent)
+				__free_page(pfn_to_page(gnt_list_entry->pfn));
+			kfree(gnt_list_entry);
+		}
+	}
+}
+
 static int blkfront_setup_indirect(struct blkfront_ring_info *rinfo)
 {
 	unsigned int segs;
@@ -1783,28 +1880,14 @@ static int blkfront_setup_indirect(struct blkfront_ring_info *rinfo)
 	return 0;
 
 out_of_memory:
-	for (i = 0; i < BLK_RING_SIZE(dinfo); i++) {
-		kfree(rinfo->shadow[i].grants_used);
-		rinfo->shadow[i].grants_used = NULL;
-		kfree(rinfo->shadow[i].sg);
-		rinfo->shadow[i].sg = NULL;
-		kfree(rinfo->shadow[i].indirect_grants);
-		rinfo->shadow[i].indirect_grants = NULL;
-	}
-	if (!list_empty(&rinfo->indirect_pages)) {
-		struct page *indirect_page, *n;
-		list_for_each_entry_safe(indirect_page, n, &rinfo->indirect_pages, lru) {
-			list_del(&indirect_page->lru);
-			__free_page(indirect_page);
-		}
-	}
+	blkfront_clean_ring(rinfo);
 	return -ENOMEM;
 }
 
 /*
  * Gather all backend feature-*
  */
-static int blkfront_gather_backend_features(struct blkfront_dev_info *dinfo)
+static void __blkfront_gather_backend_features(struct blkfront_dev_info *dinfo)
 {
 	int err;
 	int barrier, flush, discard, persistent;
@@ -1859,8 +1942,25 @@ static int blkfront_gather_backend_features(struct blkfront_dev_info *dinfo)
 	else
 		dinfo->max_indirect_segments = min(indirect_segments,
 						  xen_blkif_max_segments);
+}
 
-	return blkfront_setup_indirect(&dinfo->rinfo);
+static int blkfront_gather_backend_features(struct blkfront_dev_info *dinfo)
+{
+	int err, i;
+
+	__blkfront_gather_backend_features(dinfo);
+
+	for (i = 0; i < dinfo->nr_rings; i++) {
+		err = blkfront_setup_indirect(&dinfo->rinfo[i]);
+		if (err)
+			goto out;
+	}
+	return 0;
+
+out:
+	while (--i >= 0)
+		blkfront_clean_ring(&dinfo->rinfo[i]);
+	return err;
 }
 
 /*
@@ -1873,8 +1973,8 @@ static void blkfront_connect(struct blkfront_dev_info *dinfo)
 	unsigned long sector_size;
 	unsigned int physical_sector_size;
 	unsigned int binfo;
-	int err;
-	struct blkfront_ring_info *rinfo = &dinfo->rinfo;
+	int err, i;
+	struct blkfront_ring_info *rinfo;
 
 	switch (dinfo->connected) {
 	case BLKIF_STATE_CONNECTED:
@@ -1951,7 +2051,10 @@ static void blkfront_connect(struct blkfront_dev_info *dinfo)
 	/* Kick pending requests. */
 	spin_lock_irq(&dinfo->io_lock);
 	dinfo->connected = BLKIF_STATE_CONNECTED;
-	kick_pending_request_queues(rinfo);
+	for (i = 0; i < dinfo->nr_rings; i++) {
+		rinfo = &dinfo->rinfo[i];
+		kick_pending_request_queues(rinfo);
+	}
 	spin_unlock_irq(&dinfo->io_lock);
 
 	add_disk(dinfo->gd);
