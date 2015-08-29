@@ -123,6 +123,7 @@ MODULE_PARM_DESC(max_ring_page_order, "Maximum order of pages to be used for the
 struct blkfront_ring_info
 {
 	struct blkif_front_ring ring;
+	spinlock_t ring_lock;
 	unsigned int ring_ref[XENBUS_MAX_RING_PAGES];
 	unsigned int evtchn, irq;
 	struct work_struct work;
@@ -141,7 +142,6 @@ struct blkfront_ring_info
  * putting all kinds of interesting stuff here :-)
  */
 struct blkfront_dev_info {
-	spinlock_t io_lock;
 	struct mutex mutex;
 	struct xenbus_device *xbdev;
 	struct gendisk *gd;
@@ -637,29 +637,28 @@ static int blkif_queue_rq(struct blk_mq_hw_ctx *hctx,
 			   const struct blk_mq_queue_data *qd)
 {
 	struct blkfront_ring_info *rinfo = (struct blkfront_ring_info *)hctx->driver_data;
-	struct blkfront_dev_info *dinfo = rinfo->dinfo;
 
 	blk_mq_start_request(qd->rq);
-	spin_lock_irq(&dinfo->io_lock);
+	spin_lock_irq(&rinfo->ring_lock);
 	if (RING_FULL(&rinfo->ring))
 		goto out_busy;
 
-	if (blkif_request_flush_invalid(qd->rq, dinfo))
+	if (blkif_request_flush_invalid(qd->rq, rinfo->dinfo))
 		goto out_err;
 
 	if (blkif_queue_request(qd->rq, rinfo))
 		goto out_busy;
 
 	flush_requests(rinfo);
-	spin_unlock_irq(&dinfo->io_lock);
+	spin_unlock_irq(&rinfo->ring_lock);
 	return BLK_MQ_RQ_QUEUE_OK;
 
 out_err:
-	spin_unlock_irq(&dinfo->io_lock);
+	spin_unlock_irq(&rinfo->ring_lock);
 	return BLK_MQ_RQ_QUEUE_ERROR;
 
 out_busy:
-	spin_unlock_irq(&dinfo->io_lock);
+	spin_unlock_irq(&rinfo->ring_lock);
 	blk_mq_stop_hw_queue(hctx);
 	return BLK_MQ_RQ_QUEUE_BUSY;
 }
@@ -961,7 +960,7 @@ static void xlvbd_release_gendisk(struct blkfront_dev_info *dinfo)
 	dinfo->gd = NULL;
 }
 
-/* Must be called with io_lock holded */
+/* Must be called with ring_lock holded */
 static void kick_pending_request_queues(struct blkfront_ring_info *rinfo)
 {
 	if (!RING_FULL(&rinfo->ring))
@@ -972,10 +971,10 @@ static void blkif_restart_queue(struct work_struct *work)
 {
 	struct blkfront_ring_info *rinfo = container_of(work, struct blkfront_ring_info, work);
 
-	spin_lock_irq(&rinfo->dinfo->io_lock);
+	spin_lock_irq(&rinfo->ring_lock);
 	if (rinfo->dinfo->connected == BLKIF_STATE_CONNECTED)
 		kick_pending_request_queues(rinfo);
-	spin_unlock_irq(&rinfo->dinfo->io_lock);
+	spin_unlock_irq(&rinfo->ring_lock);
 }
 
 static void blkif_free(struct blkfront_dev_info *dinfo, int suspend)
@@ -986,7 +985,6 @@ static void blkif_free(struct blkfront_dev_info *dinfo, int suspend)
 	struct blkfront_ring_info *rinfo;
 
 	/* Prevent new requests being issued until we fix things up. */
-	spin_lock_irq(&dinfo->io_lock);
 	dinfo->connected = suspend ?
 		BLKIF_STATE_SUSPENDED : BLKIF_STATE_DISCONNECTED;
 	/* No more blkif_request(). */
@@ -996,6 +994,7 @@ static void blkif_free(struct blkfront_dev_info *dinfo, int suspend)
 	for (r_index = 0; r_index < dinfo->nr_rings; r_index++) {
 		rinfo = &dinfo->rinfo[r_index];
 
+		spin_lock_irq(&rinfo->ring_lock);
 		/* Remove all persistent grants */
 		if (!list_empty(&rinfo->grants)) {
 			list_for_each_entry_safe(persistent_gnt, n,
@@ -1071,7 +1070,7 @@ free_shadow:
 
 		/* No more gnttab callback work. */
 		gnttab_cancel_free_callback(&rinfo->callback);
-		spin_unlock_irq(&dinfo->io_lock);
+		spin_unlock_irq(&rinfo->ring_lock);
 
 		/* Flush gnttab callback work. Must be done with no locks held. */
 		flush_work(&rinfo->work);
@@ -1180,13 +1179,10 @@ static irqreturn_t blkif_interrupt(int irq, void *dev_id)
 	struct blkfront_ring_info *rinfo = (struct blkfront_ring_info *)dev_id;
 	struct blkfront_dev_info *dinfo = rinfo->dinfo;
 
-	spin_lock_irqsave(&dinfo->io_lock, flags);
-
-	if (unlikely(dinfo->connected != BLKIF_STATE_CONNECTED)) {
-		spin_unlock_irqrestore(&dinfo->io_lock, flags);
+	if (unlikely(dinfo->connected != BLKIF_STATE_CONNECTED))
 		return IRQ_HANDLED;
-	}
 
+	spin_lock_irqsave(&rinfo->ring_lock, flags);
  again:
 	rp = rinfo->ring.sring->rsp_prod;
 	rmb(); /* Ensure we see queued responses up to 'rp'. */
@@ -1279,7 +1275,7 @@ static irqreturn_t blkif_interrupt(int irq, void *dev_id)
 
 	kick_pending_request_queues(rinfo);
 
-	spin_unlock_irqrestore(&dinfo->io_lock, flags);
+	spin_unlock_irqrestore(&rinfo->ring_lock, flags);
 
 	return IRQ_HANDLED;
 }
@@ -1534,7 +1530,6 @@ static int blkfront_probe(struct xenbus_device *dev,
 	}
 
 	mutex_init(&dinfo->mutex);
-	spin_lock_init(&dinfo->io_lock);
 	dinfo->xbdev = dev;
 	dinfo->vdevice = vdevice;
 	dinfo->connected = BLKIF_STATE_DISCONNECTED;
@@ -1550,6 +1545,7 @@ static int blkfront_probe(struct xenbus_device *dev,
 	for (r_index = 0; r_index < dinfo->nr_rings; r_index++) {
 		rinfo = &dinfo->rinfo[r_index];
 
+		spin_lock_init(&rinfo->ring_lock);
 		INIT_LIST_HEAD(&rinfo->grants);
 		INIT_LIST_HEAD(&rinfo->indirect_pages);
 		rinfo->persistent_gnts_c = 0;
@@ -1650,16 +1646,16 @@ static int blkif_recover(struct blkfront_dev_info *dinfo)
 
 	xenbus_switch_state(dinfo->xbdev, XenbusStateConnected);
 
-	spin_lock_irq(&dinfo->io_lock);
-
 	/* Now safe for us to use the shared ring */
 	dinfo->connected = BLKIF_STATE_CONNECTED;
 
 	for (r_index = 0; r_index < dinfo->nr_rings; r_index++) {
 		rinfo = &dinfo->rinfo[r_index];
 
+		spin_lock_irq(&rinfo->ring_lock);
 		/* Kick any other new requests queued since we resumed */
 		kick_pending_request_queues(rinfo);
+		spin_unlock_irq(&rinfo->ring_lock);
 	}
 
 	list_for_each_entry_safe(req, n, &requests, queuelist) {
@@ -1668,7 +1664,6 @@ static int blkif_recover(struct blkfront_dev_info *dinfo)
 		BUG_ON(req->nr_phys_segments > segs);
 		blk_mq_requeue_request(req);
 	}
-	spin_unlock_irq(&dinfo->io_lock);
 	blk_mq_kick_requeue_list(dinfo->rq);
 
 	while ((bio = bio_list_pop(&bio_list)) != NULL) {
@@ -2049,13 +2044,14 @@ static void blkfront_connect(struct blkfront_dev_info *dinfo)
 	xenbus_switch_state(dinfo->xbdev, XenbusStateConnected);
 
 	/* Kick pending requests. */
-	spin_lock_irq(&dinfo->io_lock);
 	dinfo->connected = BLKIF_STATE_CONNECTED;
 	for (i = 0; i < dinfo->nr_rings; i++) {
 		rinfo = &dinfo->rinfo[i];
+
+		spin_lock_irq(&rinfo->ring_lock);
 		kick_pending_request_queues(rinfo);
+		spin_unlock_irq(&rinfo->ring_lock);
 	}
-	spin_unlock_irq(&dinfo->io_lock);
 
 	add_disk(dinfo->gd);
 
