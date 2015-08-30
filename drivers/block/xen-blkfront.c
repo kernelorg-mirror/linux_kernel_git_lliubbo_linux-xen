@@ -107,6 +107,10 @@ static unsigned int xen_blkif_max_ring_order;
 module_param_named(max_ring_page_order, xen_blkif_max_ring_order, int, S_IRUGO);
 MODULE_PARM_DESC(max_ring_page_order, "Maximum order of pages to be used for the shared ring");
 
+static unsigned int xen_blkif_max_queues;
+module_param_named(max_queues, xen_blkif_max_queues, uint, S_IRUGO);
+MODULE_PARM_DESC(max_queues, "Maximum number of hardware queues/rings per virtual disk");
+
 #define BLK_RING_SIZE(dinfo) __CONST_RING_SIZE(blkif, PAGE_SIZE * (dinfo)->pages_per_ring)
 #define BLK_MAX_RING_SIZE __CONST_RING_SIZE(blkif, PAGE_SIZE * XENBUS_MAX_RING_PAGES)
 /*
@@ -114,6 +118,7 @@ MODULE_PARM_DESC(max_ring_page_order, "Maximum order of pages to be used for the
  * characters are enough. Define to 20 to keep consist with backend.
  */
 #define RINGREF_NAME_LEN (20)
+#define QUEUE_NAME_LEN (12)
 
 /*
  *  Per-ring info.
@@ -687,7 +692,7 @@ static int xlvbd_init_blk_queue(struct gendisk *gd, u16 sector_size,
 
 	memset(&dinfo->tag_set, 0, sizeof(dinfo->tag_set));
 	dinfo->tag_set.ops = &blkfront_mq_ops;
-	dinfo->tag_set.nr_hw_queues = 1;
+	dinfo->tag_set.nr_hw_queues = dinfo->nr_rings;
 	dinfo->tag_set.queue_depth =  BLK_RING_SIZE(dinfo);
 	dinfo->tag_set.numa_node = NUMA_NO_NODE;
 	dinfo->tag_set.flags = BLK_MQ_F_SHOULD_MERGE | BLK_MQ_F_SG_MERGE;
@@ -1350,6 +1355,51 @@ fail:
 	return err;
 }
 
+static int write_per_ring_nodes(struct xenbus_transaction xbt,
+				struct blkfront_ring_info *rinfo, const char *dir)
+{
+	int err, i;
+	const char *message = NULL;
+	struct blkfront_dev_info *dinfo = rinfo->dinfo;
+
+	if (dinfo->pages_per_ring == 1) {
+		err = xenbus_printf(xbt, dir, "ring-ref", "%u", rinfo->ring_ref[0]);
+		if (err) {
+			message = "writing ring-ref";
+			goto abort_transaction;
+		}
+		pr_info("%s: write ring-ref:%d\n", dir, rinfo->ring_ref[0]);
+	} else {
+		for (i = 0; i < dinfo->pages_per_ring; i++) {
+			char ring_ref_name[RINGREF_NAME_LEN];
+
+			snprintf(ring_ref_name, RINGREF_NAME_LEN, "ring-ref%u", i);
+			err = xenbus_printf(xbt, dir, ring_ref_name,
+					    "%u", rinfo->ring_ref[i]);
+			if (err) {
+				message = "writing ring-ref";
+				goto abort_transaction;
+			}
+			pr_info("%s: write ring-ref:%d\n", dir, rinfo->ring_ref[i]);
+		}
+	}
+
+	err = xenbus_printf(xbt, dir, "event-channel", "%u", rinfo->evtchn);
+	if (err) {
+		message = "writing event-channel";
+		goto abort_transaction;
+	}
+	pr_info("%s: write event-channel:%d\n", dir, rinfo->evtchn);
+
+	return 0;
+
+abort_transaction:
+	xenbus_transaction_end(xbt, 1);
+	if (message)
+		xenbus_dev_fatal(dinfo->xbdev, err, "%s", message);
+
+	return err;
+}
 
 /* Common code used when first setting up, and when resuming. */
 static int talk_to_blkback(struct xenbus_device *dev,
@@ -1386,45 +1436,51 @@ again:
 		goto out;
 	}
 
+	if (dinfo->pages_per_ring > 1) {
+		err = xenbus_printf(xbt, dev->nodename, "ring-page-order", "%u",
+				    ring_page_order);
+		if (err) {
+			message = "writing ring-page-order";
+			goto abort_transaction;
+		}
+	}
+
+	/* We already got the number of queues in _probe */
 	if (dinfo->nr_rings == 1) {
 		rinfo = &dinfo->rinfo[0];
 
-		if (dinfo->pages_per_ring == 1) {
-			err = xenbus_printf(xbt, dev->nodename,
-					    "ring-ref", "%u", rinfo->ring_ref[0]);
-			if (err) {
-				message = "writing ring-ref";
-				goto abort_transaction;
-			}
-		} else {
-			err = xenbus_printf(xbt, dev->nodename,
-					    "ring-page-order", "%u", ring_page_order);
-			if (err) {
-				message = "writing ring-page-order";
-				goto abort_transaction;
-			}
+		err = write_per_ring_nodes(xbt, &dinfo->rinfo[0], dev->nodename);
+		if (err)
+			goto out;
+	} else {
+		char *path;
+		size_t pathsize;
 
-			for (i = 0; i < dinfo->pages_per_ring; i++) {
-				char ring_ref_name[RINGREF_NAME_LEN];
-
-				snprintf(ring_ref_name, RINGREF_NAME_LEN, "ring-ref%u", i);
-				err = xenbus_printf(xbt, dev->nodename, ring_ref_name,
-						    "%u", rinfo->ring_ref[i]);
-				if (err) {
-					message = "writing ring-ref";
-					goto abort_transaction;
-				}
-			}
-		}
-		err = xenbus_printf(xbt, dev->nodename,
-				    "event-channel", "%u", rinfo->evtchn);
+		err = xenbus_printf(xbt, dev->nodename, "multi-queue-num-queues", "%u",
+				    dinfo->nr_rings);
 		if (err) {
-			message = "writing event-channel";
+			message = "writing multi-queue-num-queues";
 			goto abort_transaction;
 		}
-	} else {
-		/* Not supported at this stage */
-		goto abort_transaction;
+
+		pathsize = strlen(dev->nodename) + QUEUE_NAME_LEN;
+		path = kzalloc(pathsize, GFP_KERNEL);
+		if (!path) {
+			err = -ENOMEM;
+			message = "ENOMEM while writing ring references";
+			goto abort_transaction;
+		}
+
+		for (i = 0; i < dinfo->nr_rings; i++) {
+			memset(path, 0, pathsize);
+			snprintf(path, pathsize, "%s/queue-%u", dev->nodename, i);
+			err = write_per_ring_nodes(xbt, &dinfo->rinfo[i], path);
+			if (err) {
+				kfree(path);
+				goto out;
+			}
+		}
+		kfree(path);
 	}
 
 	err = xenbus_printf(xbt, dev->nodename, "protocol", "%s",
@@ -1480,6 +1536,7 @@ static int blkfront_probe(struct xenbus_device *dev,
 	int err, vdevice, r_index;
 	struct blkfront_dev_info *dinfo;
 	struct blkfront_ring_info *rinfo;
+	unsigned int back_max_queues = 0;
 
 	/* FIXME: Use dynamic device id if this is not set. */
 	err = xenbus_scanf(XBT_NIL, dev->nodename,
@@ -1534,7 +1591,17 @@ static int blkfront_probe(struct xenbus_device *dev,
 	dinfo->vdevice = vdevice;
 	dinfo->connected = BLKIF_STATE_DISCONNECTED;
 
-	dinfo->nr_rings = 1;
+	/* Check if backend supports multiple queues */
+	err = xenbus_scanf(XBT_NIL, dinfo->xbdev->otherend,
+			   "multi-queue-max-queues", "%u", &back_max_queues);
+	if (err < 0)
+		back_max_queues = 1;
+
+	dinfo->nr_rings = min(back_max_queues, xen_blkif_max_queues);
+	if (dinfo->nr_rings <= 0)
+		dinfo->nr_rings = 1;
+	pr_info("dinfo->nr_rings:%u, backend support max-queues:%u\n", dinfo->nr_rings, back_max_queues);
+
 	dinfo->rinfo = kzalloc(sizeof(*rinfo) * dinfo->nr_rings, GFP_KERNEL);
 	if (!dinfo->rinfo) {
 		xenbus_dev_fatal(dev, -ENOMEM, "allocating ring_info structure");
